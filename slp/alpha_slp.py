@@ -37,6 +37,8 @@ def alpha_zero_loop(target_matrix, model, device,
                     temperature=1.0,
                     temp_threshold=20,
                     local_search_fn=None,
+                    post_iter_local_search=True,
+                    post_iter_top_k=5,
                     save_dir=None,
                     verbose=True):
     """
@@ -59,7 +61,9 @@ def alpha_zero_loop(target_matrix, model, device,
         lr: 学习率
         temperature: MCTS 动作选择温度
         temp_threshold: 前多少步使用温度采样
-        local_search_fn: 局部搜索函数（可选）
+        local_search_fn: 局部搜索函数（仅用于每轮迭代后的 top-K 优化）
+        post_iter_local_search: 是否在每轮迭代后对 top-K 结果做局部搜索
+        post_iter_top_k: 每轮迭代后局部搜索的 top-K 数量
         save_dir: 模型保存目录（可选）
         verbose: 是否打印详细信息
 
@@ -87,25 +91,28 @@ def alpha_zero_loop(target_matrix, model, device,
 
     if verbose:
         print(f"\n{'='*60}")
-        print(f"AlphaZero Self-Play Loop")
+        print(f"AlphaZero Self-Play Loop (Hamming Masking Enabled)")
         print(f"  Matrix: {n_targets}x{n_inputs}, best_known={best_known}")
         print(f"  Iterations: {n_iterations}, games/iter: {n_games_per_iter}")
         print(f"  MCTS: {n_simulations} sims, {max_children} children")
+        print(f"  Post-iter LS: top-{post_iter_top_k}" if post_iter_local_search else "  Post-iter LS: disabled")
         print(f"{'='*60}")
 
     for iteration in range(n_iterations):
         t0 = time.time()
 
-        # === Phase 1: Self-Play ===
+        # === Phase 1: Self-Play (no per-game local search) ===
         mcts_solver = MCTSSolver(
             model, device,
             c_puct=2.0,
             n_simulations=n_simulations,
             max_children=max_children,
+            use_hamming_mask=True,
         )
 
         iter_data = []
         iter_gates = []
+        iter_circuits = []
         iter_solved = 0
 
         for game in range(n_games_per_iter):
@@ -118,25 +125,38 @@ def alpha_zero_loop(target_matrix, model, device,
             if n_gates is not None:
                 iter_solved += 1
                 iter_gates.append(n_gates)
+                iter_circuits.append(list(circuit))
                 iter_data.extend(training_data)
-
-                # 局部搜索优化
-                if local_search_fn and n_gates <= best_gates + 5:
-                    try:
-                        optimized = local_search_fn(circuit, T, n_inputs)
-                        opt_gates = len(optimized)
-                        if opt_gates < n_gates:
-                            n_gates = opt_gates
-                            circuit = optimized
-                    except Exception:
-                        pass
 
                 if n_gates < best_gates:
                     best_gates = n_gates
                     best_circuit = list(circuit)
                     best_model_state = copy.deepcopy(model.state_dict())
                     if verbose:
-                        print(f"  [Iter {iteration+1}] ★ NEW BEST: {best_gates} gates (game {game+1})")
+                        print(f"  [Iter {iteration+1}] \u2605 NEW BEST: {best_gates} gates (game {game+1})")
+            else:
+                iter_circuits.append(None)
+
+        # === Post-iteration batch local search on top-K ===
+        if post_iter_local_search and local_search_fn and iter_gates:
+            game_results = sorted(
+                [(g, c) for g, c in zip(iter_gates, [c for c in iter_circuits if c is not None]) if c is not None],
+                key=lambda x: x[0]
+            )[:post_iter_top_k]
+
+            for g, c in game_results:
+                try:
+                    optimized = local_search_fn(c, T, n_inputs)
+                    opt_gates = len(optimized)
+                    if opt_gates < g:
+                        if opt_gates < best_gates:
+                            best_gates = opt_gates
+                            best_circuit = list(optimized)
+                            best_model_state = copy.deepcopy(model.state_dict())
+                            if verbose:
+                                print(f"  [Iter {iteration+1}] \u2605 LS improved: {g} \u2192 {opt_gates} gates")
+                except Exception:
+                    pass
 
         # === Phase 2: Train ===
         if iter_data:
@@ -396,13 +416,19 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--benchmark', default='aes_mixcolumns_32x32', help='Benchmark name')
     parser.add_argument('--gpu', action='store_true')
+    parser.add_argument('--mps', action='store_true')
     parser.add_argument('--iterations', type=int, default=30)
     parser.add_argument('--games', type=int, default=15)
     parser.add_argument('--sims', type=int, default=800)
     parser.add_argument('--skip-multistart', action='store_true')
     args = parser.parse_args()
 
-    device = 'cuda' if args.gpu and torch.cuda.is_available() else 'cpu'
+    if args.gpu and torch.cuda.is_available():
+        device = 'cuda'
+    elif (args.gpu or args.mps) and hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        device = 'mps'
+    else:
+        device = 'cpu'
     print(f"Device: {device}")
 
     benchmarks = load_all_benchmarks()
@@ -470,7 +496,7 @@ if __name__ == "__main__":
     print("\n=== Phase 3: AlphaZero Self-Play ===")
 
     def local_search_wrapper(circuit, matrix, n_inp):
-        return full_local_search(circuit, matrix, n_inp, time_limit=10)
+        return full_local_search(circuit, matrix, n_inp, time_limit=5)
 
     az_best, az_circuit, az_history = alpha_zero_loop(
         T, model, device,
@@ -487,6 +513,8 @@ if __name__ == "__main__":
         temperature=1.0,
         temp_threshold=20,
         local_search_fn=local_search_wrapper,
+        post_iter_local_search=True,
+        post_iter_top_k=5,
         save_dir=os.path.join(os.path.dirname(__file__), 'checkpoints'),
     )
 
@@ -497,7 +525,7 @@ if __name__ == "__main__":
     print(f"  SOTA: {sota}")
     if sota:
         if final_best <= sota:
-            print(f"  ★★★ MATCHES OR BEATS SOTA! ★★★")
+            print(f"  \u2605\u2605\u2605 MATCHES OR BEATS SOTA! \u2605\u2605\u2605")
         else:
             print(f"  Gap to SOTA: {final_best - sota} gates")
     print(f"{'='*60}")
