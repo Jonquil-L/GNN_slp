@@ -1,0 +1,35 @@
+# Context: High-Throughput GNN + MCTS Pipeline for Shortest Linear Program (SLP) Optimization
+
+**Role:** You are an expert Deep Learning and Reinforcement Learning System Architect specializing in PyTorch and GPU-accelerated computing.
+
+**Objective:** I need you to implement a highly optimized, three-stage reinforcement learning pipeline to solve the Shortest Linear Program (SLP) problem over GF(2) (specifically targeting cryptographic matrices like AES MixColumns). The system must use **PyTorch** and be heavily optimized for **GPU execution**.
+
+We are migrating from a bloated 4-layer architecture to a streamlined, high-throughput **3-Stage Architecture**. Please implement the following system:
+
+### Stage 1: Baseline Initialization Module (Data Generation)
+* **Goal:** Quickly generate high-quality initial solutions to bypass the AlphaZero "cold start" problem without wasting compute on heavy local search.
+* **Implementation Specs:**
+    * Implement algebraic decomposition specific to GF(2^8) MDS/MixColumns matrices.
+    * Implement highly parallelized random heuristic sampling (e.g., Paar's algorithm, BP algorithm) generating thousands of initial circuits.
+    * **Constraint:** *Do not* implement heavy iterative/exhaustive local search here. Simply extract the Top-50 best solutions to be used as a pre-training dataset and reference baselines.
+
+### Stage 2: Redesigned AlphaZero Engine (PyTorch + GPU)
+* **Goal:** Train a Graph Neural Network (GNN) Policy/Value network via Self-Play MCTS, completely resolving the $O(N^2)$ action space dimensionality curse.
+* **Implementation Specs:**
+    * **Environment (`SLPGraphEnv`):** Implement a vectorized, GPU-friendly environment. Avoid CPU-GPU memory bottlenecking during self-play.
+    * **Network Architecture:** Use PyTorch Geometric (PyG) or native PyTorch sparse operations to build the `SLPPolicyValueNet`. The model must take the current circuit graph as input and output a value scalar and policy logits.
+    * **Action Space Masking ($O(N^2) \to O(N)$):** Implement an intelligent action masking mechanism in PyTorch. The environment should dynamically identify a "target column vector", and the policy network should only evaluate XOR operations (actions) that reduce the Hamming distance to this target. Mask invalid or redundant actions by setting their policy logits to `-inf` before the softmax layer.
+    * **Dense Reward Shaping:** Implement a dense step-by-step reward function calculated on the GPU. Grant positive scalar rewards for XOR operations that decrease the Hamming weight relative to the target matrix, and negative rewards for generating linearly dependent (redundant) vectors.
+    * **Constraint:** *No local search* during the self-play loop to maximize GPU throughput and self-play iterations.
+
+### Stage 3: Deep Inference & Global Refinement
+* **Goal:** Utilize the trained (frozen) GNN to perform deep, highly parallelized tree search, followed by a singular, heavy refinement step.
+* **Implementation Specs:**
+    * **Deep Batched MCTS:** Run MCTS with high simulation counts (e.g., 5000+ sims). Crucially, the MCTS node evaluation must be batched and sent to the GPU to maximize hardware utilization.
+    * **Beam Search Integration:** Integrate a Beam Search (width=50) alongside the MCTS at the leaf nodes to prevent pruning optimal sub-trees.
+    * **Ultimate Local Search:** Implement an exhaustive local search algorithm (e.g., greedy backwards substitution or similar localized heuristics). **Trigger this only once** at the very end of the pipeline on the Top-5 circuits found by the deep MCTS, with a strict time limit (e.g., 300s).
+
+### Deliverables Required:
+1.  **Architecture Skeleton:** The PyTorch class structures for the `SLPGraphEnv` (batched) and the `SLPPolicyValueNet`.
+2.  **Action Masking & Dense Reward Logic:** The specific PyTorch tensor operations that implement the Hamming-distance-based action masking and dense reward computation on the GPU.
+3.  **Batched MCTS Pseudo-code/Logic:** How to batch graph evaluations during the MCTS rollout phase to avoid GPU starvation.
