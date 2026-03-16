@@ -10,12 +10,14 @@
 6. 自模仿学习 (PPO 期间回放最佳轨迹)
 7. Cosine LR 调度
 8. 向量化加速
+9. Hamming 距离引导的动作 mask
 
 预计总时长: GPU ~8-10h, CPU ~14-18h
 
 用法:
     python run_overnight.py
     python run_overnight.py --gpu
+    python run_overnight.py --mps
     python run_overnight.py --phase 2
     python run_overnight.py --quick        # ~1-2h 快速验证
 """
@@ -36,7 +38,7 @@ import math
 # 1. 向量化快速贪心专家
 # ==========================================================
 class FastGreedyExpert:
-    """numpy 全向量化的贪心专家"""
+    """​numpy 全向量化的贪心专家"""
 
     def __init__(self, temperature=0.0):
         self.temperature = temperature
@@ -257,7 +259,7 @@ def fast_paar(target_matrix):
 
 
 def paar_with_circuit(target_matrix):
-    """Paar 算法，返回 (n_gates, solved, circuit_list)"""
+    """​Paar 算法，返回 (n_gates, solved, circuit_list)"""
     T = np.array(target_matrix, dtype=np.int8).copy()
     n_targets, n_inputs = T.shape
     D = T.copy()
@@ -529,15 +531,17 @@ class MCTSSolver:
     - Policy network 提供先验概率
     - Value network 估计叶节点价值
     - UCB 选择 → 展开 → 回传
+    - 支持 Hamming 距离引导的动作 mask
     """
 
     def __init__(self, model, device, c_puct=2.0, n_simulations=400,
-                 max_children=30):
+                 max_children=30, use_hamming_mask=False):
         self.model = model
         self.device = device
         self.c_puct = c_puct
         self.n_simulations = n_simulations
         self.max_children = max_children
+        self.use_hamming_mask = use_hamming_mask
 
     def solve(self, target_matrix, max_extra, max_depth, n_restarts=3):
         """多次重启 MCTS, 取最优"""
@@ -723,6 +727,18 @@ class MCTSSolver:
             value = self.model.get_value(h, vmask).item()
 
         u_probs = F.softmax(u_logits, dim=-1)
+
+        # Hamming-aware u masking
+        if self.use_hamming_mask:
+            u_mask_np = env.get_target_aware_u_mask()
+            u_mask_t = torch.FloatTensor(u_mask_np).to(self.device)
+            u_probs = u_probs * u_mask_t
+            u_sum = u_probs.sum()
+            if u_sum > 1e-8:
+                u_probs = u_probs / u_sum
+            else:
+                u_probs = F.softmax(u_logits, dim=-1)
+
         k_u = min(10, (u_probs > 1e-6).sum().item())
         if k_u == 0:
             node.expanded = True
@@ -734,7 +750,11 @@ class MCTSSolver:
         for ui in range(k_u):
             u = top_u[ui].item()
             u_p = top_u_p[ui].item()
-            v_mask_np = env.get_v_mask(u)
+            # Hamming-aware v masking
+            if self.use_hamming_mask:
+                v_mask_np = env.get_hamming_v_mask(u)
+            else:
+                v_mask_np = env.get_v_mask(u)
             if np.sum(v_mask_np) == 0:
                 continue
             v_mask_t = torch.FloatTensor(v_mask_np).unsqueeze(0).to(self.device)
@@ -775,7 +795,7 @@ class MCTSSolver:
 # 7. Beam Search + Best-of-N
 # ==========================================================
 def beam_search_solve(model, target_matrix, max_extra, max_depth, device,
-                      beam_width=15):
+                      beam_width=15, use_hamming_mask=False):
     from gnn_env import SLPGraphEnv
     env = SLPGraphEnv(target_matrix, max_extra, max_depth)
     env.reset()
@@ -818,7 +838,10 @@ def beam_search_solve(model, target_matrix, max_extra, max_depth, device,
 
             for ui in range(k_u):
                 u = top_u[ui].item()
-                v_mask_np = env_state.get_v_mask(u)
+                if use_hamming_mask:
+                    v_mask_np = env_state.get_hamming_v_mask(u)
+                else:
+                    v_mask_np = env_state.get_v_mask(u)
                 if np.sum(v_mask_np) == 0:
                     continue
                 v_mask_t = torch.FloatTensor(v_mask_np).unsqueeze(0).to(device)
@@ -907,7 +930,7 @@ def best_of_n_evaluate(model, target_matrix, max_extra, max_depth, device,
     }
 
 
-def _sample_temperature(env, model, device, temperature):
+def _sample_temperature(env, model, device, temperature, use_hamming_mask=False):
     obs = env.reset()
     for _ in range(env.max_extra):
         feat = torch.FloatTensor(obs['node_features']).unsqueeze(0).to(device)
@@ -916,8 +939,13 @@ def _sample_temperature(env, model, device, temperature):
         with torch.no_grad():
             h = model.encode(feat, adj_t)
             u_logits = model.get_u_logits(h, vmask).squeeze(0) / temperature
-        u = Categorical(logits=u_logits).sample().item()
-        v_mask_np = env.get_v_mask(u)
+        # MPS compatibility: sample on CPU
+        u_probs = F.softmax(u_logits, dim=-1)
+        u = torch.multinomial(u_probs.cpu(), 1).item() if device == 'mps' else Categorical(logits=u_logits).sample().item()
+        if use_hamming_mask:
+            v_mask_np = env.get_hamming_v_mask(u)
+        else:
+            v_mask_np = env.get_v_mask(u)
         if np.sum(v_mask_np) == 0:
             break
         v_mask_t = torch.FloatTensor(v_mask_np).unsqueeze(0).to(device)
@@ -925,7 +953,8 @@ def _sample_temperature(env, model, device, temperature):
             v_logits = model.get_v_logits(
                 h, torch.LongTensor([u]).to(device), v_mask_t, vmask
             ).squeeze(0) / temperature
-        v = Categorical(logits=v_logits).sample().item()
+        v_probs = F.softmax(v_logits, dim=-1)
+        v = torch.multinomial(v_probs.cpu(), 1).item() if device == 'mps' else Categorical(logits=v_logits).sample().item()
         obs, reward, done, info = env.step(u, v)
         if done:
             break
@@ -970,7 +999,7 @@ def comprehensive_evaluate(model, target_matrix, max_extra, max_depth, device,
         if verify_circuit(simp, target_matrix, num_inputs):
             mcts_simplified = len(simp)
             if mcts_simplified < mcts_gates:
-                print(f"      Simplified: {mcts_gates} → {mcts_simplified}")
+                print(f"      Simplified: {mcts_gates} \u2192 {mcts_simplified}")
 
     all_gates = [g for g in [bon_min, beam_min, mcts_gates, mcts_simplified]
                  if g is not None]
@@ -1176,7 +1205,7 @@ def train_gnn_improved(target_matrix, num_inputs, max_extra, max_depth,
                 if ng < best_gates:
                     best_gates = ng
                     best_circuit = env_tmp.circuit.copy()
-                    print(f"  [{label}] ★ NEW BEST: {best_gates} gates (PPO {it+1})")
+                    print(f"  [{label}] \u2605 NEW BEST: {best_gates} gates (PPO {it+1})")
                 # 自模仿 buffer
                 top_trajs.append((ng, [
                     {k: t[k] for k in ('features', 'adj', 'valid_mask', 'v_mask', 'u', 'v')}
@@ -1218,7 +1247,7 @@ def train_gnn_improved(target_matrix, num_inputs, max_extra, max_depth,
         if verify_circuit(simp, target_matrix, num_inputs):
             best_simplified = len(simp)
             if best_simplified < best_gates:
-                print(f"  [{label}] PPO best simplified: {best_gates} → {best_simplified}")
+                print(f"  [{label}] PPO best simplified: {best_gates} \u2192 {best_simplified}")
 
     # === 综合评估 ===
     print(f"  [{label}] Comprehensive evaluation...")
@@ -1403,15 +1432,21 @@ def run_key_ablations(target_matrix, device, quick=False):
 def main():
     args = sys.argv[1:]
     use_gpu = '--gpu' in args
+    use_mps = '--mps' in args
     quick = '--quick' in args
     only_phase = None
     if '--phase' in args:
         idx = args.index('--phase')
         only_phase = int(args[idx + 1])
 
-    device = 'cuda' if (use_gpu or torch.cuda.is_available()) else 'cpu'
+    if use_gpu and torch.cuda.is_available():
+        device = 'cuda'
+    elif (use_gpu or use_mps) and hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        device = 'mps'
+    else:
+        device = 'cpu'
     print(f"Device: {device}")
-    print(f"Mode: {'QUICK' if quick else 'OVERNIGHT v2 (MCTS + simplify + lookahead)'}")
+    print(f"Mode: {'QUICK' if quick else 'OVERNIGHT v2 (MCTS + simplify + lookahead + Hamming mask)'}")
     print(f"Start: {time.strftime('%Y-%m-%d %H:%M:%S')}")
     print()
 
@@ -1508,7 +1543,6 @@ def main():
         from benchmark_matrices import get_midori_16x16_matrix
         matrix = get_midori_16x16_matrix()
 
-        # Paar 需要 48 gates → max_extra 至少 50; 给 PPO 探索留余量
         res = train_gnn_improved(
             matrix, 16, max_extra=80, max_depth=16, hidden_dim=128, device=device,
             il_epochs=40 if quick else 100,
@@ -1530,7 +1564,6 @@ def main():
         from benchmark_matrices import get_aes_mixcolumns_matrix, get_aes_inv_mixcolumns_matrix
 
         matrix = get_aes_mixcolumns_matrix()
-        # Paar 需要 108 gates → max_extra 至少 120; max_depth 放宽
         res = train_gnn_improved(
             matrix, 32, max_extra=160, max_depth=20, hidden_dim=256, device=device,
             il_epochs=30 if quick else 80,
@@ -1543,7 +1576,6 @@ def main():
         if not quick:
             print("\n  --- AES InvMixColumns 32x32 ---")
             matrix2 = get_aes_inv_mixcolumns_matrix()
-            # Paar 需要 160 gates → max_extra 至少 170
             res2 = train_gnn_improved(
                 matrix2, 32, max_extra=200, max_depth=20, hidden_dim=256, device=device,
                 il_epochs=80, ppo_iters=200, episodes_per_iter=20,
@@ -1633,7 +1665,7 @@ def main():
         json.dump(all_results, f, indent=2, ensure_ascii=False, default=str)
 
     print(f"\nEnd: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"Results → experiment_results/overnight_results.json")
+    print(f"Results \u2192 experiment_results/overnight_results.json")
 
 
 if __name__ == "__main__":
