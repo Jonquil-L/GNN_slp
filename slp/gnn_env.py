@@ -90,6 +90,7 @@ class SLPGraphEnv:
         reward = -1.0
         remaining = int(np.sum(~self.achieved))
         newly_achieved = 0
+        any_hamming_improvement = False
 
         for t in range(self.num_targets):
             if not self.achieved[t]:
@@ -100,8 +101,15 @@ class SLPGraphEnv:
                     progress = 1.0 - (remaining - newly_achieved) / max(self.num_targets, 1)
                     reward += 10.0 + 8.0 * progress
                 elif dist < self.min_dist[t]:
-                    reward += 0.5 * (self.min_dist[t] - dist)
+                    reward += 1.5 * (self.min_dist[t] - dist)
                     self.min_dist[t] = dist
+                    any_hamming_improvement = True
+
+        # 冗余惩罚：新向量未改进任何目标且与已有向量过于接近
+        if newly_achieved == 0 and not any_hamming_improvement:
+            min_hamming_to_existing = np.min(np.sum(valid_nodes != new_vec, axis=1))
+            if min_hamming_to_existing <= 1:
+                reward -= 2.0
 
         done = False
         if np.all(self.achieved):
@@ -158,6 +166,99 @@ class SLPGraphEnv:
         mask[over_depth] = 0.0
         return mask
 
+    def get_hamming_v_mask(self, u, fallback=True):
+        """
+        Target-aware v masking: 仅保留能使某个未达成目标的 Hamming 距离严格下降的 v。
+        若 mask 全零则 fallback 到 get_v_mask(u)。
+        复杂度 O(N * T * num_inputs)，对典型规模可忽略。
+        """
+        base_mask = self.get_v_mask(u)
+
+        unachieved = np.where(~self.achieved)[0]
+        if len(unachieved) == 0:
+            return base_mask
+
+        valid_v_indices = np.where(base_mask > 0)[0]
+        if len(valid_v_indices) == 0:
+            return base_mask
+
+        # 向量化 XOR: nodes[u] XOR nodes[each valid v]
+        u_vec = self.nodes[u]  # (num_inputs,)
+        v_vecs = self.nodes[valid_v_indices]  # (n_valid, num_inputs)
+        new_vecs = (u_vec.astype(np.int16) + v_vecs.astype(np.int16)) % 2  # (n_valid, num_inputs)
+
+        # 过滤零向量
+        nonzero = np.any(new_vecs, axis=1)
+
+        # 检查重复
+        valid_nodes_set = set()
+        for idx in np.where(self.valid)[0]:
+            valid_nodes_set.add(self.nodes[idx].tobytes())
+        not_dup = np.array([nv.tobytes() not in valid_nodes_set for nv in new_vecs.astype(np.int8)])
+
+        # 计算到所有未达成目标的 Hamming 距离
+        target_vecs = self.target[unachieved]  # (n_unachieved, num_inputs)
+        # broadcasting: (n_valid, 1, num_inputs) vs (1, n_unachieved, num_inputs)
+        dists = np.sum(new_vecs[:, None, :].astype(np.int8) != target_vecs[None, :, :], axis=2)  # (n_valid, n_unachieved)
+
+        # 当前各未达成目标的最小距离
+        current_min = self.min_dist[unachieved]  # (n_unachieved,)
+
+        # v 有用条件：创建的向量比当前最近向量更接近某个目标
+        improves = dists < current_min[None, :]  # (n_valid, n_unachieved)
+        exact_match = np.any(dists == 0, axis=1)
+        useful = np.any(improves, axis=1) | exact_match
+
+        # 综合过滤
+        useful = useful & nonzero & not_dup
+
+        # 构建 hamming mask
+        hamming_mask = np.zeros(self.max_nodes, dtype=np.float32)
+        hamming_mask[valid_v_indices[useful]] = 1.0
+
+        # Fallback: 如果过滤太激进（全零），回退到基础 mask
+        if fallback and np.sum(hamming_mask) == 0:
+            return base_mask
+
+        return hamming_mask
+
+    def get_target_aware_u_mask(self):
+        """
+        过滤 u 候选：仅保留与某个未达成目标有 bit 重叠的节点。
+        输入基向量始终保留。若过滤后 < 2 个节点则 fallback。
+        """
+        base_mask = self.valid.astype(np.float32).copy()
+
+        unachieved = np.where(~self.achieved)[0]
+        if len(unachieved) == 0:
+            return base_mask
+
+        valid_idx = np.where(self.valid)[0]
+        if len(valid_idx) < 2:
+            return base_mask
+
+        valid_nodes = self.nodes[valid_idx]  # (n_valid, num_inputs)
+        target_vecs = self.target[unachieved]  # (n_ua, num_inputs)
+
+        # 对每个 valid node，检查与任意未达成目标的 bit 重叠
+        # overlap[i, j] = sum(valid_nodes[i] & target_vecs[j])
+        overlap = np.einsum('vi,ti->vt', valid_nodes.astype(np.int16), target_vecs.astype(np.int16))
+        u_useful = np.any(overlap >= 1, axis=1)  # (n_valid,)
+
+        # 输入基向量始终保留
+        for i, idx in enumerate(valid_idx):
+            if idx < self.num_inputs:
+                u_useful[i] = True
+
+        u_mask = np.zeros(self.max_nodes, dtype=np.float32)
+        u_mask[valid_idx[u_useful]] = 1.0
+
+        # Fallback: 过滤后不足 2 个则回退
+        if np.sum(u_mask) < 2:
+            return base_mask
+
+        return u_mask
+
     def step_fast(self, u, v):
         """快速 step: 跳过 get_obs() 计算，MCTS/搜索专用，快 5-10x"""
         if u == v or u >= self.max_nodes or v >= self.max_nodes:
@@ -193,6 +294,7 @@ class SLPGraphEnv:
         reward = -1.0
         remaining = int(np.sum(~self.achieved))
         newly_achieved = 0
+        any_hamming_improvement = False
 
         for t in range(self.num_targets):
             if not self.achieved[t]:
@@ -203,8 +305,15 @@ class SLPGraphEnv:
                     progress = 1.0 - (remaining - newly_achieved) / max(self.num_targets, 1)
                     reward += 10.0 + 8.0 * progress
                 elif dist < self.min_dist[t]:
-                    reward += 0.5 * (self.min_dist[t] - dist)
+                    reward += 1.5 * (self.min_dist[t] - dist)
                     self.min_dist[t] = dist
+                    any_hamming_improvement = True
+
+        # 冗余惩罚
+        if newly_achieved == 0 and not any_hamming_improvement:
+            min_hamming_to_existing = np.min(np.sum(valid_nodes != new_vec, axis=1))
+            if min_hamming_to_existing <= 1:
+                reward -= 2.0
 
         done = False
         if np.all(self.achieved):
