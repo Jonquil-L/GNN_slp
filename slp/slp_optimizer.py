@@ -1,14 +1,14 @@
 """
 SLP (Shortest Linear Program) 优化器：GNN + MCTS 混合框架。
 
-四层优化策略:
-  Layer 0: 代数分解 (AES-specific) — 利用 GF(2^8) 循环矩阵结构
-  Layer 1: 随机化多起点 Paar/BP + 局部搜索
-  Layer 2: GNN 预训练 + AlphaZero 自博弈
-  Layer 3: 深度 MCTS 搜索 + 穷举局部搜索
+三阶段优化策略:
+  Stage 1: 快速基线 — 代数分解 + 轻量多起点搜索
+  Stage 2: AlphaZero 自博弈 + Hamming 动作 Mask
+  Stage 3: 深度 MCTS 搜索 + 单次终极穷举局部搜索
 
 用法:
-    python slp_optimizer.py --gpu                          # 全部密码学 benchmark
+    python slp_optimizer.py --gpu                          # 全部密码学 benchmark (CUDA)
+    python slp_optimizer.py --mps                          # 全部密码学 benchmark (Apple Silicon)
     python slp_optimizer.py --gpu --bench aes_mixcolumns_32x32
     python slp_optimizer.py --gpu --quick                  # 快速模式
     python slp_optimizer.py --experiment                   # 结题报告完整实验
@@ -32,6 +32,16 @@ from gnn_network import SLPPolicyValueNet
 from alpha_slp import alpha_zero_loop, pretrain_from_circuits
 
 
+def select_device(args):
+    """设备选择：cuda → mps → cpu 优先级自动检测"""
+    if args.gpu and torch.cuda.is_available():
+        return 'cuda'
+    elif (getattr(args, 'mps', False) or args.gpu) and hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        return 'mps'
+    else:
+        return 'cpu'
+
+
 def is_aes_mixcolumns(target_matrix, n_inputs):
     """检测是否为 AES MixColumns (32x32)"""
     return n_inputs == 32 and len(target_matrix) == 32
@@ -49,7 +59,7 @@ def layer0_algebraic(T, n_inputs, verbose=True):
         return []
 
     if verbose:
-        print(f"\n  --- Layer 0: Algebraic Decomposition (AES-specific) ---")
+        print(f"\n  --- Algebraic Decomposition (AES-specific) ---")
 
     try:
         from algebraic_decompose import generate_algebraic_circuits
@@ -69,19 +79,23 @@ def layer0_algebraic(T, n_inputs, verbose=True):
 
         results.sort(key=lambda x: x[1])
         if verbose and results:
-            print(f"  Layer 0 best: {results[0][1]} gates ({results[0][2]})")
+            print(f"  Algebraic best: {results[0][1]} gates ({results[0][2]})")
         return results
 
     except Exception as e:
         if verbose:
-            print(f"  Layer 0 failed: {e}")
+            print(f"  Algebraic decomposition failed: {e}")
         return []
 
 
 def optimize_pipeline(target_matrix, n_inputs, sota_gates=None, device='cpu',
                       quick=False, verbose=True):
     """
-    完整的 SLP 优化流水线。
+    3-Stage SLP 优化流水线。
+
+    Stage 1: 快速基线 (代数分解 + 轻量多起点搜索，不跑 ILS/穷举 LS)
+    Stage 2: AlphaZero + Hamming Masking (post-iter batch LS)
+    Stage 3: Deep MCTS + Hamming Mask + 单次终极穷举 LS
 
     Returns:
         results: dict with best_gates, best_circuit, phase details
@@ -91,7 +105,7 @@ def optimize_pipeline(target_matrix, n_inputs, sota_gates=None, device='cpu',
     results = {'n_inputs': n_inputs, 'n_targets': n_targets, 'sota': sota_gates}
     t_total = time.time()
 
-    # === Baseline ===
+    # === Paar Baseline ===
     paar = PaarAlgorithm()
     paar_circuit, paar_gates = paar.solve(T)
     results['paar_gates'] = paar_gates
@@ -101,7 +115,16 @@ def optimize_pipeline(target_matrix, n_inputs, sota_gates=None, device='cpu',
     best_gates = paar_gates
     best_circuit = paar_circuit
 
-    # === Layer 0: Algebraic Decomposition (AES-specific) ===
+    # =========================================================
+    # Stage 1: 快速基线
+    # 代数分解 + 轻量多起点搜索 (不跑 ILS 和穷举 LS)
+    # =========================================================
+    if verbose:
+        print(f"\n  {'='*50}")
+        print(f"  Stage 1: Fast Baseline")
+        print(f"  {'='*50}")
+
+    # 代数分解 (AES-specific)
     algebraic_results = layer0_algebraic(T, n_inputs, verbose=verbose)
     if algebraic_results:
         alg_circuit, alg_gates, alg_name = algebraic_results[0]
@@ -111,18 +134,17 @@ def optimize_pipeline(target_matrix, n_inputs, sota_gates=None, device='cpu',
             best_gates = alg_gates
             best_circuit = alg_circuit
 
-    # === Layer 1: Multi-Start + Local Search ===
+    # 轻量多起点搜索 (n_paar 减半, 少量 LS)
     if verbose:
-        print(f"\n  --- Layer 1: Multi-Start Search ---")
+        print(f"\n  --- Lightweight Multi-Start Search ---")
 
-    n_paar = 1000 if quick else 5000
-    n_bp = 300 if quick else 2000
-    time_limit_ms = 60 if quick else 300
-    ls_top = 10 if quick else 50
-    ls_time = 10 if quick else 30
+    n_paar = 500 if quick else 2500
+    time_limit_ms = 30 if quick else 150
+    ls_top = 5
+    ls_time = 5
 
     ms_circuit, ms_gates, ms_stats = multi_start_search(
-        T, n_paar=n_paar, n_bp=n_bp,
+        T, n_paar=n_paar, n_bp=0,
         time_limit=time_limit_ms,
         local_search_top=ls_top,
         local_search_time=ls_time,
@@ -136,49 +158,19 @@ def optimize_pipeline(target_matrix, n_inputs, sota_gates=None, device='cpu',
     results['multistart_gates'] = ms_gates
     results['multistart_stats'] = ms_stats
 
-    # ILS (Iterated Local Search)
     if verbose:
-        print(f"\n  --- Layer 1b: Iterated Local Search ---")
-
-    ils_n = 50 if quick else 200
-    ils_time = 30 if quick else 180
-
-    ils_circuit, ils_gates = iterated_local_search(
-        T, num_inputs=n_inputs,
-        n_restarts=ils_n,
-        time_limit=ils_time,
-        verbose=verbose,
-    )
-
-    if ils_gates < best_gates and verify_circuit(ils_circuit, T, n_inputs):
-        best_gates = ils_gates
-        best_circuit = ils_circuit
-
-    results['ils_gates'] = ils_gates
-
-    # Exhaustive local search on best so far
-    if verbose:
-        print(f"\n  --- Layer 1c: Exhaustive Local Search on best ({best_gates} gates) ---")
-    exh_time = 30 if quick else 120
-    exh_circuit = exhaustive_local_search(
-        best_circuit, T, n_inputs, time_limit=exh_time, verbose=verbose
-    )
-    exh_gates = len(exh_circuit)
-    if exh_gates < best_gates and verify_circuit(exh_circuit, T, n_inputs):
-        if verbose:
-            print(f"  ★ Exhaustive LS improved: {best_gates} → {exh_gates}")
-        best_gates = exh_gates
-        best_circuit = exh_circuit
-    results['exhaustive_ls_gates'] = exh_gates
-
-    if verbose:
-        print(f"\n  Layer 1 result: {best_gates} gates (Paar={paar_gates})")
+        print(f"\n  Stage 1 result: {best_gates} gates (Paar={paar_gates})")
         if sota_gates:
             print(f"  Gap to SOTA: {best_gates - sota_gates}")
 
-    # === Layer 2: AlphaZero Self-Play ===
+    # =========================================================
+    # Stage 2: AlphaZero + Hamming Masking
+    # 预训练 + 自博弈 (post-iter batch LS on top-K)
+    # =========================================================
     if verbose:
-        print(f"\n  --- Layer 2: AlphaZero Self-Play ---")
+        print(f"\n  {'='*50}")
+        print(f"  Stage 2: AlphaZero + Hamming Masking")
+        print(f"  {'='*50}")
 
     max_extra = n_inputs * 6
     env = SLPGraphEnv(T, max_extra, max_depth=10)
@@ -226,29 +218,31 @@ def optimize_pipeline(target_matrix, n_inputs, sota_gates=None, device='cpu',
         verbose=verbose,
     )
 
-    # AlphaZero with scaled-up parameters
+    # AlphaZero with Hamming masking + post-iter batch LS
     def local_search_wrapper(circuit, matrix, n_inp):
-        return full_local_search(circuit, matrix, n_inp, time_limit=10)
+        return full_local_search(circuit, matrix, n_inp, time_limit=5)
 
-    az_iters = 10 if quick else 40       # 30 → 40
-    az_games = 8 if quick else 25        # 20 → 25
-    az_sims = 400 if quick else 1200     # 800 → 1200
+    az_iters = 10 if quick else 40
+    az_games = 8 if quick else 25
+    az_sims = 400 if quick else 1200
 
     az_best, az_circuit, az_history = alpha_zero_loop(
         T, model, device,
         n_iterations=az_iters,
         n_games_per_iter=az_games,
         n_simulations=az_sims,
-        max_children=60,                  # 50 → 60
+        max_children=60,
         max_extra=max_extra,
         max_depth=10,
         best_known=best_gates,
-        train_epochs=10,                  # 8 → 10
+        train_epochs=10,
         train_batch_size=16 if n_inputs >= 32 else 32,
         lr=1e-4,
         temperature=1.0,
-        temp_threshold=20,                # 15 → 20
+        temp_threshold=20,
         local_search_fn=local_search_wrapper,
+        post_iter_local_search=True,
+        post_iter_top_k=5,
         save_dir=None,
         verbose=verbose,
     )
@@ -261,49 +255,58 @@ def optimize_pipeline(target_matrix, n_inputs, sota_gates=None, device='cpu',
     results['az_best'] = az_best
     results['az_history'] = az_history
 
-    # === Layer 3: Deep MCTS + Final Local Search ===
     if verbose:
-        print(f"\n  --- Layer 3: Deep MCTS ---")
+        print(f"\n  Stage 2 result: {best_gates} gates")
+
+    # =========================================================
+    # Stage 3: Deep MCTS + Hamming Mask + 单次终极穷举 LS
+    # =========================================================
+    if verbose:
+        print(f"\n  {'='*50}")
+        print(f"  Stage 3: Deep MCTS + Final Exhaustive LS")
+        print(f"  {'='*50}")
 
     from run_overnight import MCTSSolver, beam_search_solve
 
-    # Deep MCTS with scaled-up simulations
-    deep_sims = 800 if quick else 2400    # 1600 → 2400
-    deep_restarts = 3 if quick else 15    # 10 → 15
+    # Deep MCTS with Hamming masking
+    deep_sims = 800 if quick else 2400
+    deep_restarts = 3 if quick else 15
     mcts_solver = MCTSSolver(
         model, device,
         c_puct=2.0,
         n_simulations=deep_sims,
-        max_children=100,                  # 80 → 100
+        max_children=100,
+        use_hamming_mask=True,
     )
     mcts_gates, mcts_circuit = mcts_solver.solve(
         T, max_extra, 10, n_restarts=deep_restarts
     )
 
     if mcts_gates and mcts_circuit:
-        # 穷举局部搜索优化 MCTS 结果
-        optimized = exhaustive_local_search(mcts_circuit, T, n_inputs, time_limit=60)
-        if verify_circuit(optimized, T, n_inputs):
-            opt_gates = len(optimized)
+        if verify_circuit(mcts_circuit, T, n_inputs):
             if verbose:
-                print(f"  MCTS: {mcts_gates} → {opt_gates} gates (after exhaustive LS)")
-            if opt_gates < best_gates:
-                best_gates = opt_gates
-                best_circuit = optimized
+                print(f"  MCTS result: {mcts_gates} gates")
+            if mcts_gates < best_gates:
+                best_gates = mcts_gates
+                best_circuit = mcts_circuit
 
     results['mcts_gates'] = mcts_gates
 
-    # Beam search with wider beam
-    beam_w = 20 if quick else 50          # 20 → 50
-    beam_gates = beam_search_solve(model, T, max_extra, 10, device, beam_width=beam_w)
+    # Beam search with Hamming masking
+    beam_w = 20 if quick else 50
+    beam_gates = beam_search_solve(
+        model, T, max_extra, 10, device,
+        beam_width=beam_w,
+        use_hamming_mask=True,
+    )
     if beam_gates:
         results['beam_gates'] = beam_gates
         if verbose:
             print(f"  Beam search (w={beam_w}): {beam_gates} gates")
 
-    # === Final: Exhaustive local search on global best ===
+    # === 单次终极穷举局部搜索 (仅对全局最优 top-1) ===
     if verbose:
-        print(f"\n  --- Final exhaustive optimization ({best_gates} gates) ---")
+        print(f"\n  --- Final exhaustive optimization on best ({best_gates} gates) ---")
     final_time = 60 if quick else 300
     final_circuit = exhaustive_local_search(
         best_circuit, T, n_inputs, time_limit=final_time, verbose=verbose
@@ -415,7 +418,7 @@ def run_experiment_suite(device='cpu', quick=False):
     # 目的: 在有已知 SOTA 的经典矩阵上定位本方法的水平
     # ================================================================
     print(f"\n{'='*70}")
-    print(f"  实验 2: 密码学 benchmark (Layer 0 + Layer 1)")
+    print(f"  实验 2: 密码学 benchmark (Stage 1)")
     print(f"{'='*70}")
 
     benchmarks = load_all_benchmarks()
@@ -432,11 +435,11 @@ def run_experiment_suite(device='cpu', quick=False):
         paar = PaarAlgorithm()
         paar_circuit, paar_gates = paar.solve(T)
 
-        # Layer 0: 代数分解
+        # 代数分解
         algebraic_results = layer0_algebraic(T, n_inputs, verbose=False)
         alg_best = algebraic_results[0][1] if algebraic_results else None
 
-        # Layer 1: 多起点
+        # 多起点搜索
         ms_circuit, ms_gates, _ = multi_start_search(
             T, n_paar=300 if quick else 800,
             n_bp=0,
@@ -548,7 +551,7 @@ def run_experiment_suite(device='cpu', quick=False):
         _, paar_g = paar.solve(M)
         paar_time = time.time() - t0
 
-        # 本框架 (Layer 1)
+        # 本框架 (Stage 1)
         t0 = time.time()
         ms_c, ms_g, _ = multi_start_search(
             M, n_paar=100 if quick else 300, n_bp=0,
@@ -575,12 +578,12 @@ def run_experiment_suite(device='cpu', quick=False):
     all_exp['exp4_scalability'] = scale_results
 
     # ================================================================
-    # 实验 5: AlphaZero 收敛曲线 (仅在有 GPU 时)
+    # 实验 5: AlphaZero 收敛曲线 (需要 GPU/MPS)
     # 目的: 展示自博弈训练过程中 gate 数的下降
     # ================================================================
     if device != 'cpu':
         print(f"\n{'='*70}")
-        print(f"  实验 5: AlphaZero 收敛曲线 (16x16 random)")
+        print(f"  实验 5: AlphaZero 收敛曲线 (16x16 random) [device={device}]")
         print(f"{'='*70}")
 
         dim_az = 16
@@ -626,6 +629,8 @@ def run_experiment_suite(device='cpu', quick=False):
             train_epochs=3, train_batch_size=32, lr=1e-4,
             temperature=1.0, temp_threshold=10,
             local_search_fn=ls_wrap,
+            post_iter_local_search=True,
+            post_iter_top_k=5,
             save_dir=None, verbose=True,
         )
 
@@ -639,8 +644,8 @@ def run_experiment_suite(device='cpu', quick=False):
         print(f"  Paar={paar_g}, AlphaZero best={az_best}, "
               f"改进={paar_g - az_best if az_best else 0}")
     else:
-        print(f"\n  实验 5: 跳过 (需要 GPU, 用 --gpu 启用)")
-        all_exp['exp5_convergence'] = {'skipped': True, 'reason': 'no GPU'}
+        print(f"\n  实验 5: 跳过 (需要 GPU/MPS, 用 --gpu 或 --mps 启用)")
+        all_exp['exp5_convergence'] = {'skipped': True, 'reason': 'no GPU/MPS'}
 
     # ================================================================
     # 总结
@@ -669,19 +674,20 @@ def run_experiment_suite(device='cpu', quick=False):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='SLP Optimizer: GNN + MCTS 混合框架')
-    parser.add_argument('--gpu', action='store_true')
+    parser = argparse.ArgumentParser(description='SLP Optimizer: GNN + MCTS 混合框架 (3-Stage)')
+    parser.add_argument('--gpu', action='store_true', help='Use CUDA GPU')
+    parser.add_argument('--mps', action='store_true', help='Use Apple Silicon MPS')
     parser.add_argument('--bench', type=str, default=None,
                         help='Specific benchmark (e.g., aes_mixcolumns_32x32)')
     parser.add_argument('--quick', action='store_true',
                         help='Quick mode with reduced search')
     parser.add_argument('--layer1-only', action='store_true',
-                        help='Only run Layer 0+1 (algebraic + multi-start + local search)')
+                        help='Only run Stage 1 (algebraic + multi-start)')
     parser.add_argument('--experiment', action='store_true',
                         help='Run full experiment suite for report')
     args = parser.parse_args()
 
-    device = 'cuda' if args.gpu and torch.cuda.is_available() else 'cpu'
+    device = select_device(args)
     print(f"Device: {device}")
     print(f"Mode: {'Quick' if args.quick else 'Full'}")
     print(f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -713,7 +719,7 @@ def main():
         print(f"{'='*60}")
 
         if args.layer1_only:
-            # Layer 0 + Layer 1
+            # Stage 1 only
             algebraic_results = layer0_algebraic(T, n_inputs, verbose=True)
 
             ms_circuit, ms_gates, ms_stats = multi_start_search(
